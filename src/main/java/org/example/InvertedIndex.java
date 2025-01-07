@@ -4,18 +4,24 @@ import lombok.AllArgsConstructor;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
-import java.io.IOException;
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Stream;
 
 @Slf4j
 public class InvertedIndex {
 
-    public final Path DOCUMENTS_DIRECTORY = Path.of("C:\\Users\\alex\\Desktop\\docs");
-    public final ConcurrentMap<String, List<String>> index = new ConcurrentHashMap<>();
+    private final int threadCount;
+    private final Path documentDir;
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ConcurrentMap<String, List<String>> index = new ConcurrentHashMap<>();
+    private final Map<String, Object> indexedDocs = new HashMap<>();
 
     @AllArgsConstructor
     private class IndexWorker extends Thread {
@@ -34,30 +40,37 @@ public class InvertedIndex {
     }
 
     @SneakyThrows
-    public InvertedIndex(int threadCount, List<String> documents) {
-        List<Thread> threads = new ArrayList<>();
-        for (int i = 0; i < threadCount; i++) {
-            Thread thread = new IndexWorker(i, threadCount, documents);
-            thread.start();
-            threads.add(thread);
-        }
+    public InvertedIndex(int threadCount, String documentDir, int updatePeriod) {
+        this.documentDir = Path.of(documentDir);
+        this.threadCount = threadCount;
+        updateIndex();
 
-        for (var thread : threads) {thread.join();}
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                updateIndex();
+            }
+        }, updatePeriod, updatePeriod);
     }
 
     public List<String> getDocuments(String key) {
-        return index.get(key);
-    }
-
-    public void addDocument(String document) {
-        synchronized (index) {
-            indexDocument(document);
+        try {
+            lock.readLock().lock();
+            return index.getOrDefault(key, List.of());
+        } finally {
+            lock.readLock().unlock();
         }
     }
 
+//    public void addDocument(String document) {
+//        synchronized (index) {
+//            indexDocument(document);
+//        }
+//    }
+
     @SneakyThrows
     private void indexDocument(String document) {
-        String content = Files.readString(DOCUMENTS_DIRECTORY.resolve(document));
+        String content = Files.readString(documentDir.resolve(document));
         String[] words = content.replaceAll("[^A-Za-z\\s]", "").toLowerCase().split("\\s+");
         Set<String> terms = new HashSet<>(Arrays.asList(words));
 
@@ -68,6 +81,32 @@ public class InvertedIndex {
             });
         }
 
+        indexedDocs.put(document, new Object());
         InvertedIndex.log.info("indexed document: {}", document);
+    }
+
+    private void updateIndex() {
+        List<String> newDocs = Stream.of(documentDir.toFile().listFiles())
+                .map(File::getName)
+                .filter(d -> !indexedDocs.containsKey(d))
+                .toList();
+
+        try {
+            lock.writeLock().lock();
+            List<Thread> threads = new ArrayList<>();
+            for (int i = 0; i < threadCount; i++) {
+                Thread thread = new IndexWorker(i, threadCount, newDocs);
+                thread.start();
+                threads.add(thread);
+            }
+
+            for (var thread : threads) {
+                try {
+                    thread.join();
+                } catch (InterruptedException ignored) {}
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 }
